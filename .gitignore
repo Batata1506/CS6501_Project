@@ -12,3 +12,4 @@ venv/
 .vscode/
 *.csv
 *.mp3
+*.pkl
