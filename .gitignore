@@ -12,8 +12,4 @@ venv/
 .vscode/
 *.csv
 *.mp3
-<<<<<<< HEAD
-*.pkl
-=======
-*.pkl
->>>>>>> f7172782a691cc9b4487a94f31fcee45c5edf52b
+processed_data/*.pkl
