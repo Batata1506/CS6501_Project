@@ -7,7 +7,6 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import pearsonr
 from pathlib import Path
 import re
-import matplotlib.cm as cm
 import time
 import psutil
 import os
@@ -48,24 +47,61 @@ for f in pkl_files:
     print("  -", f.name)
 
 # ----------------------------------------------------------------------
-# LSTM Model
+# CNN + BiLSTM Model
 # ----------------------------------------------------------------------
-class EmotionLSTM(nn.Module):
-    def __init__(self, input_size, hidden=128, layers=4, dropout=0.4):
+class CNNBiLSTM(nn.Module):
+    def __init__(self, input_size, conv_channels=(128, 256),
+                 lstm_hidden=128, lstm_layers=2, dropout=0.4):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden, layers,
-                            batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden, 2)
+
+        c1, c2 = conv_channels
+
+        self.conv1 = nn.Conv1d(input_size, c1, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(c1)
+        self.pool1 = nn.MaxPool1d(kernel_size=2)
+
+        self.conv2 = nn.Conv1d(c1, c2, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(c2)
+        self.pool2 = nn.MaxPool1d(kernel_size=2)
+
+        self.bilstm = nn.LSTM(
+            input_size=c2,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout
+        )
+
+        self.fc1 = nn.Linear(2 * lstm_hidden, 64)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(64, 2)
+        self.act = nn.ReLU()
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.fc(out[:, -1, :])
+        # x: [batch, T, F] → conv expects [batch, F, T]
+        x = x.permute(0, 2, 1)
+
+        x = self.pool1(self.act(self.bn1(self.conv1(x))))
+        x = self.pool2(self.act(self.bn2(self.conv2(x))))
+
+        # back to [batch, T, C]
+        x = x.permute(0, 2, 1)
+
+        out, _ = self.bilstm(x)
+        last = out[:, -1, :]
+
+        z = self.act(self.fc1(last))
+        z = self.dropout(z)
+        return self.fc2(z)
+
 
 # ----------------------------------------------------------------------
-# Train Loop + analytics
+# Train loop + analytics
 # ----------------------------------------------------------------------
-def train_lstm(X_train, y_train, X_val, y_val, input_size, epochs=40, lr=5e-4):
-    model = EmotionLSTM(input_size).to(device)
+def train_cnn_bilstm(X_train, y_train, X_val, y_val,
+                     input_size, epochs=40, lr=5e-4):
+    model = CNNBiLSTM(input_size=input_size).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=5, factor=0.5
@@ -79,15 +115,14 @@ def train_lstm(X_train, y_train, X_val, y_val, input_size, epochs=40, lr=5e-4):
     train_dl = DataLoader(train_ds, batch_size=32, shuffle=True)
     val_dl = DataLoader(val_ds, batch_size=32)
 
-    # Analytics
     param_count = count_params(model)
     start_time = time.perf_counter()
+    last_stats = None
 
     EARLY_STOP = False
     best_loss = float("inf")
     patience = 8
     patience_counter = 0
-    epoch_stats = None
 
     for epoch in range(epochs):
         model.train()
@@ -98,7 +133,6 @@ def train_lstm(X_train, y_train, X_val, y_val, input_size, epochs=40, lr=5e-4):
             loss.backward()
             optimizer.step()
 
-        # Validation
         model.eval()
         with torch.no_grad():
             val_loss = np.mean([
@@ -107,9 +141,7 @@ def train_lstm(X_train, y_train, X_val, y_val, input_size, epochs=40, lr=5e-4):
             ])
 
         scheduler.step(val_loss)
-
-        # Latest CPU stats
-        epoch_stats = get_cpu_stats()
+        last_stats = get_cpu_stats()
 
         if EARLY_STOP:
             if val_loss < best_loss:
@@ -124,10 +156,10 @@ def train_lstm(X_train, y_train, X_val, y_val, input_size, epochs=40, lr=5e-4):
         if (epoch + 1) % 5 == 0:
             print(f"  Epoch {epoch+1}/{epochs} - val_loss: {val_loss:.4f}")
             print(
-                f"    CPU: {epoch_stats['cpu_percent']:.1f}% | "
-                f"RAM: {epoch_stats['memory_mb']:.1f} MB | "
-                f"user_time: {epoch_stats['user_time']:.1f}s | "
-                f"sys_time: {epoch_stats['system_time']:.1f}s"
+                f"      CPU: {last_stats['cpu_percent']:.1f}% | "
+                f"RAM: {last_stats['memory_mb']:.1f} MB | "
+                f"user: {last_stats['user_time']:.1f}s | "
+                f"sys: {last_stats['system_time']:.1f}s"
             )
 
     total_time = time.perf_counter() - start_time
@@ -137,19 +169,19 @@ def train_lstm(X_train, y_train, X_val, y_val, input_size, epochs=40, lr=5e-4):
         "params": param_count,
         "total_time_sec": total_time,
         "time_per_epoch_sec": time_per_epoch,
-        "cpu_percent_final": epoch_stats["cpu_percent"] if epoch_stats else None,
-        "memory_mb_final": epoch_stats["memory_mb"] if epoch_stats else None,
-        "user_time_final": epoch_stats["user_time"] if epoch_stats else None,
-        "system_time_final": epoch_stats["system_time"] if epoch_stats else None,
+        "cpu_percent": last_stats["cpu_percent"],
+        "memory_mb": last_stats["memory_mb"],
+        "user_time": last_stats["user_time"],
+        "system_time": last_stats["system_time"],
     }
 
     return model, stats
+
 
 # ----------------------------------------------------------------------
 # Run for all clip lengths
 # ----------------------------------------------------------------------
 results = []
-predictions = {}
 
 for file in pkl_files:
     match = re.search(r"(\d+)s", file.name)
@@ -173,7 +205,7 @@ for file in pkl_files:
     y_min, y_max = np.min(y, axis=0), np.max(y, axis=0)
     y_norm = (y - y_min) / (y_max - y_min)
 
-    # Train/val split (randomised for fairness)
+    # 80/20 split with fixed seed
     rng = np.random.default_rng(seed=42)
     idx = np.arange(len(X))
     rng.shuffle(idx)
@@ -186,14 +218,13 @@ for file in pkl_files:
 
     input_size = X.shape[2]
 
-    model, stats = train_lstm(X_train, y_train, X_val, y_val, input_size)
+    model, stats = train_cnn_bilstm(X_train, y_train, X_val, y_val, input_size)
 
     # Evaluate
     model.eval()
     with torch.no_grad():
         y_pred = model(torch.tensor(X_val, dtype=torch.float32).to(device)).cpu().numpy()
 
-    # Denormalize
     y_pred = y_pred * (y_max - y_min) + y_min
     y_true = y_norm[val_idx] * (y_max - y_min) + y_min
 
@@ -203,7 +234,7 @@ for file in pkl_files:
     r_a, _ = pearsonr(y_true[:, 1], y_pred[:, 1])
 
     results.append({
-        "model": "LSTM",
+        "model": "CNN+BiLSTM",
         "clip_len": clip_len,
         "rmse_val": rmse_v,
         "rmse_aro": rmse_a,
@@ -212,24 +243,22 @@ for file in pkl_files:
         "params": stats["params"],
         "time_per_epoch": stats["time_per_epoch_sec"],
         "total_time": stats["total_time_sec"],
-        "memory_mb": stats["memory_mb_final"],
-        "cpu_percent": stats["cpu_percent_final"],
-        "user_time": stats["user_time_final"],
-        "system_time": stats["system_time_final"],
+        "cpu_percent": stats["cpu_percent"],
+        "memory_mb": stats["memory_mb"],
+        "user_time": stats["user_time"],
+        "system_time": stats["system_time"],
     })
 
-    predictions[clip_len] = {"valence": y_pred[:, 0], "arousal": y_pred[:, 1]}
-
-    print(f"{clip_len}s → RMSE V:{rmse_v:.3f}, A:{rmse_a:.3f} |  r V:{r_v:.3f}, A:{r_a:.3f}")
+    print(f"{clip_len}s → RMSE V:{rmse_v:.3f}, A:{rmse_a:.3f} | r V:{r_v:.3f}, A:{r_a:.3f}")
     print(
         f"   Params: {stats['params']:,} | "
         f"Time/epoch: {stats['time_per_epoch_sec']:.2f}s | "
-        f"RAM: {stats['memory_mb_final']:.1f} MB | "
-        f"CPU: {stats['cpu_percent_final']:.1f}%"
+        f"RAM: {stats['memory_mb']:.1f} MB | "
+        f"CPU: {stats['cpu_percent']:.1f}%"
     )
 
 # ----------------------------------------------------------------------
-# Summary table (for your report)
+# Summary table (for report)
 # ----------------------------------------------------------------------
 print("\n================ SUMMARY ================")
 for r in sorted(results, key=lambda x: x["clip_len"]):
@@ -244,7 +273,7 @@ for r in sorted(results, key=lambda x: x["clip_len"]):
     )
 
 # ----------------------------------------------------------------------
-# Plot RMSE and Correlation vs clip length
+# Plot RMSE + Correlation
 # ----------------------------------------------------------------------
 results_sorted = sorted(results, key=lambda x: x["clip_len"])
 durations = [r["clip_len"] for r in results_sorted]
@@ -257,8 +286,8 @@ plt.figure(figsize=(8, 5))
 plt.plot(durations, rmse_v, "o-", label="Valence RMSE")
 plt.plot(durations, rmse_a, "s-", label="Arousal RMSE")
 plt.xlabel("Audio Clip Length (s)")
-plt.ylabel("RMSE (lower = better)")
-plt.title("LSTM Performance vs Clip Length (DEAM – most active segments)")
+plt.ylabel("RMSE")
+plt.title("CNN+BiLSTM RMSE vs Clip Length")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
@@ -268,8 +297,8 @@ plt.figure(figsize=(8, 5))
 plt.plot(durations, r_v, "o-", label="Valence r")
 plt.plot(durations, r_a, "s-", label="Arousal r")
 plt.xlabel("Audio Clip Length (s)")
-plt.ylabel("Correlation (higher = better)")
-plt.title("LSTM Correlation vs Clip Length (DEAM – most active segments)")
+plt.ylabel("Correlation")
+plt.title("CNN+BiLSTM Correlation vs Clip Length")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
